@@ -26,3 +26,40 @@ class Chunk:
     def to_row(self) -> dict:
         """Dict shape matching storage/schema.py, ready to insert into LanceDB."""
         return asdict(self)
+    
+    
+EdgeKind = Literal["calls", "imports"]
+
+
+@dataclass(frozen=True)
+class Edge:
+    """
+    One raw, NOT-yet-resolved relationship found while walking a file.
+
+    The source side is resolved immediately, because it is never ambiguous:
+    while walking the tree we already know exactly which chunk we're
+    standing inside (Phase 1 built that chunk's id one step earlier).
+
+    The target side is deliberately left as a raw name, because resolving
+    it (which actual chunk does "save" refer to, out of possibly several?)
+    requires cross-file lookup and ranked-candidate matching — that
+    judgment call is Phase 3's job, not this one's.
+    """
+
+    kind: EdgeKind                    # "calls" | "imports"
+    file_path: str                     # file this edge was found in (relative to root)
+
+    source_chunk_id: str | None        # resolved chunk id, or None if at module level
+    source_qualified_name: str          # e.g. "LoginHandler.validate", or "<module>"
+
+    target_name: str                    # bare rightmost name, e.g. "save", "Path"
+    target_expression: str               # full text, e.g. "self.db.save", "os.path.join"
+
+    # Only meaningful for kind == "imports"; empty string for "calls".
+    imported_from_module: str            # e.g. "pathlib" for `from pathlib import Path`, else ""
+    local_alias: str                      # e.g. "Opt" for `Optional as Opt`, else same as target_name
+
+    def to_row(self) -> dict:
+        """Dict shape matching storage/schema.py, ready to insert into LanceDB."""
+        return asdict(self)
+    
