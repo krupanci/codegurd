@@ -78,6 +78,23 @@ class Storage:
         safe_path = file_path.replace("'", "''")
         return table.search().where(f"file_path = '{safe_path}'").to_list()
 
+    def all_chunks(self) -> list[dict]:
+        """
+        Every chunk row in the project, unfiltered - added in Phase 3.
+
+        Phase 3 builds the call graph in memory from a full snapshot of
+        both tables (not a per-file slice like the staleness-check methods
+        above use), so this is a plain unfiltered scan. No `.where()`
+        clause, matching the same `table.search()` pattern already used
+        elsewhere in this class - `search()` here is just "read rows",
+        since the `chunks` table has no vector column yet (that only
+        arrives in Phase 6).
+        """
+        table = self._chunks_table()
+        if table.count_rows() == 0:
+            return []
+        return table.search().to_list()
+
     # --- edges (Phase 2) --------------------------------------------------
     # Deliberately mirrors the chunk methods above exactly - same delete +
     # re-insert pattern for staleness, same class, same style. No new
@@ -98,3 +115,11 @@ class Storage:
         table = self._edges_table()
         safe_path = file_path.replace("'", "''")
         return table.search().where(f"file_path = '{safe_path}'").to_list()
+
+    def all_edges(self) -> list[dict]:
+        """Every edge row in the project, unfiltered - added in Phase 3,
+        same reasoning as `all_chunks()` above."""
+        table = self._edges_table()
+        if table.count_rows() == 0:
+            return []
+        return table.search().to_list()

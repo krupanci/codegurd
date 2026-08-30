@@ -144,4 +144,144 @@ same scope-tracking as calls, rather than being treated as a special case.
   `if __name__ == "__main__":`. All produced exactly the expected edges.
 
 
+  =====================================================================
+  ## Phase 3 — The Hand-Rolled Graph
+
+### Decision A — Do `imports` edges become part of the call graph too
+**Chosen: no.** Only `calls` edges are resolved and wired into the
+forward/reverse adjacency maps. `imports` edges are still read back out of
+LanceDB and used *during* resolution (to know what a name refers to when
+it wasn't defined in the same file), but an import itself never becomes a
+forward/reverse graph edge.
+**Why:** the graph's whole purpose, per the plan, is "who calls/depends on
+whom" so Phase 4 can find zero-incoming-edge symbols and Phase 5 can find
+real callers of a changed signature. An import doesn't have call-site
+arguments and isn't a place execution actually happens, so folding it into
+the same adjacency structure would blur two different kinds of fact
+together for no benefit to either later phase. If a future need shows up
+(e.g. "flag re-exported names as used even with zero direct callers"),
+that's a separate, explicit lookup against the raw `imports` edges already
+sitting in LanceDB — not a reason to widen the graph's definition now.
+
+### Decision B — How the graph is represented in memory
+**Chosen: a `Graph` class wrapping two plain dicts of sets**
+(`dict[str, set[str]]` for forward and reverse), not raw dicts passed
+around everywhere, and not a dict of lists.
+**Why a class:** Phases 4, 5, and 7 all need to walk this same structure.
+Giving them one object with `callees()`, `callers()`, `walk_forward()`,
+`walk_reverse()` means the traversal logic is written once and lives in
+one place, instead of every feature re-implementing its own BFS over raw
+dicts.
+**Why sets, not lists:** traversal only cares whether an edge exists
+between two nodes, not how many times a call happens to repeat; sets give
+free de-duplication and O(1) "have I seen this neighbor" checks, which
+BFS needs constantly. The trade-off — losing call *counts* — was judged
+not worth carrying, since none of Phases 4/5/7 currently ask "how many
+times," only "does a path exist."
+
+### Decision C — What to do with module-level calls (no enclosing chunk)
+**Chosen: a synthetic pseudo-node id, `"<module>::<file_path>"`**, used as
+the source of the edge instead of skipping it or reusing a shared
+`"<module>"` id across every file.
+**Why:** Phase 2's Decision C already made sure a call like `main()` inside
+`if __name__ == "__main__":` produces a real edge with `source_chunk_id =
+None`. Dropping that edge here would silently undo that work and make
+`main` look orphaned to Phase 4. A single shared `"<module>"` id across
+every file was considered and rejected — it would incorrectly merge
+"top-level code in file A" and "top-level code in file B" into one node,
+which is harmless for basic orphan detection but would be a wrong
+foundation to build later features on (e.g. Phase 5 potentially reasoning
+about *which* file's module-level code is the caller). One id per file
+costs nothing extra and keeps the graph honest.
+
+### Decision D — Name resolution: priority chain vs. a numeric score
+**Chosen: a plain if/elif-style priority chain** (same file → imported
+module → global), returning as soon as any tier produces a match, over a
+weighted-scoring approach.
+**Why:** the plan's own spec is already exactly three ordered tiers, not
+a continuum of signals to balance — a numeric score (e.g. same-file=100,
+imported=50, global=10) would just be the same three buckets wearing
+extra arithmetic. A priority chain is directly readable: for any resolved
+edge you can say in one sentence which rule fired and why. Building the
+per-file import index *before* resolving any calls (`build_import_index`)
+was necessary either way, since tier 2 can't work without knowing what a
+file imported ahead of time — this isn't a fork, both approaches need it.
+
+### Decision E — What happens when a tier matches more than one chunk
+**Chosen: keep every match from that tier as a ranked candidate on the
+`ResolvedEdge`, and wire a graph edge to ALL of them** — never guess a
+single "best" one and never drop the edge.
+**Why:** the plan is explicit that silent guessing is worse than admitted
+ambiguity here ("if it's still ambiguous, keep multiple ranked candidates
+rather than silently guessing one"). Concretely: if two `save` methods
+exist and both are visible to a caller at the same tier, marking only one
+of them as "has a caller" would risk Phase 4 wrongly reporting the other
+as dead code. Adding an edge to every candidate is the conservative
+choice — it can occasionally suppress a real orphan report, but it can
+never fabricate a false one, which is the safer failure mode for a tool
+whose credibility depends on not crying wolf (see Phase 4's own stated
+goal). Every `ResolvedEdge` with more than one candidate is also kept on
+`Graph.ambiguous` for later inspection — nothing here is silently
+swallowed even in the accepted trade-off case.
+
+### Decision F — Traversal: BFS or DFS, recursive or iterative
+**Chosen: iterative BFS, using `collections.deque` and an explicit visited
+set.**
+**Why BFS over DFS:** the plan's own language for both this phase and
+Phase 7 is "walk outward N steps / N hops" — that's precisely what BFS
+measures for free, since everything found at queue-depth *k* really is
+*k* hops away. DFS would need the same depth-tracking bolted on by hand to
+answer the same question, with no upside in return.
+**Why iterative over recursive:** call graphs commonly contain cycles —
+mutual recursion, or a function calling itself. A recursive walk needs a
+visited set threaded through every call anyway to avoid looping forever,
+and still risks Python's recursion limit on a long, unbroken chain. An
+iterative loop with an explicit queue and visited set handles cycles
+safely with no such risk, at the cost of a few more lines of plain loop
+code — judged a clearly better trade here, not a close call.
+
+### Decision G — Resolved edge as its own type, not a mutated `Edge`
+**Chosen: a new frozen `ResolvedEdge` dataclass** (wrapping the original
+`Edge` plus a tuple of `ResolvedCandidate`s and a confidence tier), rather
+than adding a `resolved_chunk_id` field onto `Edge` itself.
+**Why:** `Edge` is frozen (Phase 2, Decision D) specifically because it
+represents an immutable raw fact — it can't be mutated in place once
+resolution happens, and monkeying around that with `dataclasses.replace()`
+would blur the same raw-fact/judgment-call boundary Phase 2 deliberately
+drew between "a call to a name called `save` was found" and "that name
+most likely refers to chunk X." Keeping `ResolvedEdge` as a distinct type
+means the original `Edge` rows in LanceDB are never reinterpreted or
+touched — Phase 3 only ever reads them and produces new, separate objects
+in memory.
+
+### Decision H — Loading strategy from LanceDB
+**Chosen: one unfiltered `table.search().to_list()` per table**
+(`Storage.all_chunks()`, `Storage.all_edges()`), loading everything into
+memory in one shot — no pagination or batching.
+**Why:** this project's own architecture decision already commits to
+rebuilding the entire graph in memory on every run, for a single project's
+worth of code (thousands of rows at most, not millions). Pagination would
+be solving a scale problem this project doesn't have, at the cost of real
+code complexity today. Matches the existing per-file read pattern in
+`Storage` exactly (`table.search().where(...)`), just without the
+`.where()` filter.
+
+### Other Phase 3 notes
+- `build_graph(chunks, edges)` takes plain lists and does no I/O itself —
+  `build_graph_from_storage(storage)` is the thin wrapper that does the
+  actual LanceDB reads and hands off to it. This split means the graph
+  construction logic (the part actually worth testing carefully) can be
+  unit-tested with hand-built `Chunk`/`Edge` lists and zero database setup.
+- Import resolution (`_guess_file_for_module`) only ever matches names
+  back to files that were actually parsed into the `chunks` table — a call
+  to a stdlib or third-party function (`os.path.join`, `requests.get`)
+  correctly ends up `unresolved`, since there's no project chunk for it to
+  point to. This is expected, not a gap: those calls aren't part of "what
+  in *our* codebase depends on what."
+- Verified by hand against the sample project's `if __name__ ==
+  "__main__": main()` case, an ambiguous two-`save()`-methods case, and a
+  same-file recursive call — all three landed in the tier and
+  candidate-count the design above predicts.
+
+
 
