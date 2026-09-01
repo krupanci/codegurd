@@ -283,5 +283,135 @@ code complexity today. Matches the existing per-file read pattern in
   same-file recursive call — all three landed in the tier and
   candidate-count the design above predicts.
 
+  =======================================================================
+  =====================================================================
+  ## Phase 4 — Dead Code / Orphan Finder
+
+### Decision A — Where Phase 4 lives in the package
+**Chosen: a new top-level package, `deadcode/`**, split into
+`models.py`, `rules.py`, `decorators.py`, `finder.py` — not folded into
+`graph/`.
+**Why:** matches the one-concern-per-file split already used everywhere
+else (`chunker.py` vs `edges.py`, `graph.py` vs `resolver.py`). Phase 4
+only ever *reads* the Phase 3 `Graph` — it never adds methods to it or
+changes how it's built — so it earns its own package rather than growing
+`graph/` into a second, unrelated responsibility.
+
+### Decision B — Exclusion rules: hardcoded table vs. user config file
+**Chosen: a small, hardcoded, hand-picked set of decorator names**
+(`rules.KNOWN_DYNAMIC_DECORATORS`) baked into the code, not a
+user-editable YAML/config file.
+**Why:** researched vulture (fully user-config, zero hardcoded defaults —
+`ignore_decorators` starts empty) vs. skylos (ships a hardcoded,
+framework-aware pattern table for Flask/Django/FastAPI/pytest). A config
+system is real, speculative machinery for a need that hasn't shown up
+yet — matches the project's own established pattern of not building
+infrastructure ahead of a real requirement. Isolated in its own file so
+swapping to config later is a contained change, not a rewrite.
+
+### Decision C — Binary exclude vs. confidence tiers
+**Chosen: tiered confidence output** (`high_confidence_dead`,
+`test_only`, `possibly_dynamic_usage`, `possibly_used_outside_python`),
+never a silent binary include/exclude.
+**Why:** vulture's own confidence-score model (60/90/100, never a flat
+yes/no) validates this shape independently. Binary exclusion would
+destroy information a human might want (e.g. "this decorated function
+might still be genuinely dead"); a tier just adds doubt without deleting
+the finding. Directly matches Phase 3 Decision E's own philosophy: never
+fabricate false certainty in either direction.
+
+### Decision D — Decorator detection: extend `Chunk`, or look up on demand
+**Chosen: look it up on demand at report time**, by re-reading the
+source file (`decorators.get_decorator_names`) using `chunk.file_path` +
+`chunk.start_line` — no change to `Chunk`, `chunker.py`, or
+`CHUNKS_SCHEMA`.
+**Why:** discovered that `chunk.content` starts at the
+`function_definition`/`class_definition` node itself, never the wrapping
+`decorated_definition` node — so no `Chunk` currently records whether it
+had a decorator at all. Extending the schema was rejected for the same
+reason Phase 2 Decision C deferred call-target resolution: decorator
+info is a Phase-4-only judgment call, not a raw fact worth persisting on
+every chunk forever. Re-reading the file is cheap (one file, one time,
+only for actual orphan candidates) and touches nothing already tested.
+**Known limitation, stated directly in the code's own docstring:** a
+decorator call spanning multiple lines only has its last line detected
+correctly — accepted, not silently hidden; noted for Phase 9.
+
+### Decision E — Test-only detection: string match vs. graph-aware check
+**Chosen: plain substring/pattern check on caller file paths**
+(`tests/`, `test_` prefix, `_test.py` suffix), applied only to chunks
+that DO have callers, checked in a separate branch before the
+zero-caller orphan logic runs.
+**Why:** a chunk with zero callers can't be "test-only" (there's nothing
+to check) — this branch exists specifically for chunks like
+`format_currency`, called only by `test_format_currency`. Kept as a
+plain string check (no parsing) since real project layouts are
+consistent enough that a regex would just be the same checks wearing
+extra syntax, matching Phase 3 Decision D's own "don't add machinery a
+continuum doesn't need" reasoning.
+
+### Decision F — Cross-language safety net: full parsing vs. plain-text scan
+**Chosen: a dumb, literal whole-word text search** for a candidate's bare
+symbol name across `.html`/`.js`/`.jsx`/`.json`/`.yaml`/`.yml`/`.toml`
+files — no JS/HTML/Jinja parsing of any kind.
+**Why:** researched whether real cross-language call resolution (parsing
+JS, matching URL strings to Flask routes, etc.) was feasible — rejected
+as out of scope: it would require understanding a second/third language's
+*semantics*, not just its syntax, to connect e.g. a JS `fetch(url)` to a
+Python route decorator. A plain name search catches the actual common
+cases (task-queue JSON configs, Jinja template calls) for near-zero cost,
+because a string-based cross-language reference has no way to exist
+except by containing the Python symbol's literal name as text somewhere.
+Matched as a **whole word only** (regex `\bname\b`), not a substring, so
+`"save"` doesn't false-match inside `"save_all"`.
+**Known limitation, accepted explicitly:** URL-based coupling (JS calling
+a route by path, not by function name) is not caught, since the route
+string and the function name are often different words. Not solved here;
+recorded as an open gap for Phase 9, not something over-engineered around.
+
+### Decision G — Class instantiation as usage: verified, not re-solved
+**Checked, not re-decided:** `resolver.py`'s `_CALLABLE_KINDS` already
+includes `"class"` alongside `"function"`/`"method"`, so `LoginHandler()`
+already wires a real edge into the class chunk. Phase 4 needed no special
+handling for classes — a risk flagged during design turned out to already
+be solved by Phase 3's own resolver.
+
+### Decision H — Static call-graph approach: confirmed against outside research
+**Chosen: keep the hand-rolled, tiered static resolver as-is** — not
+switched to a full points-to/alias analysis (PyCG-style), not switched to
+scope-blind name matching (Vulture-style), not extended with runtime
+tracing (coverage.py) in this phase.
+**Why:** researched PyCG (ICSE 2021, academic points-to analysis) —
+published numbers show even a far more rigorous static call graph than
+ours tops out around 99.2% precision / **69.9% recall**, and a follow-up
+paper (JARVIS) reports PyCG failing to scale past ~2,000 LOC. This
+confirms two things: (1) our simpler tiered resolver is a reasonable,
+deliberate trade-off given the project's own goal of hand-building
+understanding, not a shortcut mistake, and (2) **no static analysis,
+including a much more sophisticated one, can be advertised as complete**
+— which is exactly why Decision C's tiered-confidence output (not a flat
+verdict) is the right call, not just a nice-to-have. Dynamic/coverage-based
+cross-checking was identified as a real, complementary future option but
+deliberately deferred, not built now — recorded as a documented, known
+limitation ("static analysis; dynamic/reflective calls may not be
+detected — cross-check with coverage.py for critical decisions") rather
+than quietly ignored.
+
+### Other Phase 4 notes
+- Entry point (`main()` / `if __name__ == "__main__": main()`) needed no
+  special-case exclusion rule at all — Phase 2 Decision C + Phase 3
+  Decision C (the `<module>::file_path` pseudo-node) already guarantee
+  `graph.callers("main")` is non-empty, so it never reaches the orphan
+  branch in the first place.
+- `find_dead_code(graph, project_root)` takes a plain `Graph` object and
+  does the file-reading (decorators, cross-language scan) itself — no
+  new `Storage` methods were needed, matching Phase 3's own
+  `build_graph(chunks, edges)` / `build_graph_from_storage(storage)`
+  split (pure logic vs. I/O wrapper).
+- Verified by manual compile check (`py_compile`) against the real
+  `Chunk`/`Edge`/`Graph`/resolver code already in the repo — no changes
+  required to any Phase 1–3 file, schema, or table.
+
+
 
 
