@@ -413,5 +413,89 @@ than quietly ignored.
   required to any Phase 1–3 file, schema, or table.
 
 
+============================================================================
+
+=======================================================================
+## Phase 5 — Change-Impact Analyzer (Blast Radius, v1)
+
+### Decision A — Scope: blast radius only, not breakage classification
+**Chosen:** ship "which callers are in the blast radius of this signature
+change" first, and explicitly defer "would this specific call site error"
+to a later phase.
+**Why:** the two are genuinely separable problems — one is "walk the graph
+I already built," the other is real language-semantics reasoning (arg
+binding, keyword matching) that deserves its own design pass, the same way
+Phase 3 (build the graph) and Phase 4 (use it for dead code) were kept
+separate even though Phase 4 depends entirely on Phase 3. Shipping the
+blast-radius version first also gives something usable and testable
+immediately, instead of blocking on the harder half.
+
+### Decision B — Getting old-version content: `git show` via gitpython, not a temp file
+**Chosen:** `repo.git.show(f"{ref}:{rel_path}")` to get the old file's text
+directly as a string in memory, and parse it via a new `Chunker.parse_source()`
+method instead of writing it to a temporary file on disk and reusing
+`parse_file()` unchanged.
+**Why:** `parse_file()` was written for Phase 1 assuming a real file on
+disk (it reads bytes and computes a blob hash from a path). The old
+version from git isn't a file that exists anywhere — writing a temp file
+just to satisfy that assumption would be extra I/O and cleanup for no
+benefit. Splitting the walking logic (`parse_source`) from the
+disk-reading logic (`parse_file`, which now just reads bytes and calls
+`parse_source`) matches the same "separate raw logic from I/O" pattern
+already used for `build_graph` vs `build_graph_from_storage` (Phase 3).
+
+### Decision C — Signature extraction: re-parse `chunk.content`, no schema change
+**Chosen:** to compare old vs new signatures, re-parse each chunk's own
+stored `content` text (which already contains the full `def ...:` line)
+with tree-sitter, and pull out just the `parameters` field text — no new
+column added to the `chunks` table, no change to `Chunk` itself.
+**Why:** identical reasoning to Phase 4, Decision D (decorator detection):
+a function's parameter text is a judgment call needed only by this one
+feature, not a raw fact worth persisting on every chunk forever. Chunk
+content is already in hand from the normal parse, so re-parsing just that
+snippet is cheap and touches nothing already tested in Phases 1–4.
+
+### Decision D — What counts as "changed": signature text, not full body
+**Chosen:** compare only the parameter-list text between old and new
+versions of a chunk with the same `chunk_id`. A function whose body
+changed but whose signature didn't is not reported by this feature.
+**Why:** matches the feature's actual purpose — "will other code that
+calls this need to change" is a signature question, not a body question.
+This was already flagged as the right boundary in earlier research
+(comparing whole function bodies was rejected as too noisy — most body
+changes don't affect callers at all, and a tool that flags them anyway
+risks the same "crying wolf" failure mode Phase 4 was careful to avoid).
+
+### Decision E — Blast radius traversal: reuse `Graph.walk_reverse()` as-is
+**Chosen:** for each changed symbol's `chunk_id`, call the existing
+`Graph.walk_reverse()` from Phase 3 with no depth limit (full transitive
+closure), and group the results by hop distance for display.
+**Why:** this is exactly the traversal Phase 3 was built to provide —
+no new graph logic needed. Showing hop distance (not just a flat list)
+gives useful signal for free: a 1-hop caller is a direct, likely-urgent
+fix; a 4-hop caller is worth knowing about but less immediately at risk.
+
+### Decision F — Comparison scope: functions/methods only, classes excluded
+**Chosen:** signature diffing only applies to chunks of kind `"function"`
+or `"method"`. Class chunks are skipped in the diff step (a class doesn't
+have a "signature" the way a function does — its `__init__` is already
+its own separate method chunk and gets diffed on its own).
+**Why:** avoids inventing a meaningless comparison (e.g. comparing a
+class's base-class list as if it were a "signature") for a case the
+feature isn't actually trying to solve yet.
+
+### Other Phase 5 (v1) notes
+- New top-level package: `impact/`, split as `models.py`, `git_ops.py`,
+  `differ.py`, `analyzer.py`, `report.py` — one concern per file, matching
+  the existing `deadcode/` package's own split.
+- Deleted files (present in git diff but no longer on disk) are currently
+  skipped entirely in this pass — the "everything in this file just
+  disappeared" case is a distinct scenario from "a signature changed" and
+  is recorded as a known limitation for Phase 9, not solved here.
+- Newly added files (no old-ref content to compare against) are also
+  skipped — nothing to diff against, so nothing can be "changed" in them
+  under this feature's definition.
+
+
 
 

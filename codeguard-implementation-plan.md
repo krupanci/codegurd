@@ -224,30 +224,47 @@ rule might apply.
 
 ---
 
-## Phase 5 — Feature Two: Change-Impact Analyzer
+## Phase 5 — Feature Two: Change-Impact Analyzer (Blast Radius, v1)
 
-**Goal:** given a code change (a diff against a git ref), determine exactly
-which callers would break, structurally, with no LLM involved.
+**Goal:** given a git ref, find every symbol whose signature changed, and show
+the full set of callers (direct and indirect) that could be affected —
+the "blast radius" — using the existing graph. This phase deliberately
+stops at *"here's what touches this"*, not yet *"here's what will actually
+error"* — that judgment layer is a follow-up phase once this foundation is
+proven.
 
-**What & why:** this phase has three distinct steps:
+**What & why:** this phase has four steps, each reusing something already
+built rather than inventing new machinery:
 
-1. **Get old vs new content.** Use `gitpython` to pull a file's content as it
-   existed at a given ref, and compare it against the current working
-   version, to know which files actually changed.
-2. **Diff signatures structurally.** Re-parse both the old and new version of
-   each changed file with the Phase 1 chunker, match up chunks by their
-   stable ID, and compare old vs new parameter lists directly — was a
-   parameter removed, renamed, reordered, or did the count change.
-3. **Check real breakage, not just "this changed."** For every symbol whose
-   signature changed, use the Phase 3 reverse map to find every caller, then
-   look at each caller's actual call-site arguments (how many positional
-   args, which keyword args) and decide whether that specific call would now
-   fail against the new signature — this is what separates a genuinely
-   useful tool from one that just says "5 callers exist, good luck."
+1. **Get changed files.** Use `gitpython` to diff the working tree against
+   a given ref and get the list of changed `.py` files.
+2. **Parse old vs new.** Pull each changed file's content at the old ref
+   (`git show <ref>:<path>`) and parse it with the *same* Phase 1 chunker
+   used everywhere else — via a new `Chunker.parse_source()` entry point
+   that works on raw text instead of requiring a file on disk. Parse the
+   current on-disk version the normal way (`parse_file`), so both sides
+   go through identical logic and are truly comparable.
+3. **Detect changed symbols.** Match old and new chunks by their stable
+   `chunk_id` (Phase 1, Decision B — this is exactly what that ID was
+   built for). For every function/method present in both, re-extract just
+   its parameter-list text and compare old vs new. A symbol only counts as
+   "changed" here if its *signature* text differs — a changed function
+   body with the same signature is out of scope for this feature.
+4. **Walk the reverse graph and report blast radius.** For every changed
+   symbol, use the Phase 3 `Graph.walk_reverse()` (already built, already
+   tested) to find every caller, transitively, with hop distance. Display
+   this as a simple tree: the changed symbol, its old vs new signature,
+   and every affected caller grouped by how many hops away it is.
 
-**Output of this phase:** a report per changed symbol: old signature vs new
-signature, and a clearly split list of "will break" callers vs "unaffected"
-callers.
+**Explicitly deferred to a later phase:** deciding whether a specific
+call site's arguments would actually fail against the new signature.
+v1 answers "what could be affected," not "what will break" — the report
+lists every caller in the blast radius without a verdict attached, so
+nothing is silently hidden or falsely marked safe.
+
+**Output of this phase:** running `codeguard impact <ref>` prints, for
+every changed symbol: its old signature, its new signature, and a full
+list of affected callers grouped by hop distance from the change.
 
 ---
 

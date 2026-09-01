@@ -1,6 +1,7 @@
 """
-The chunker: turns a single .py file into a list of Chunk objects, and
-(as of Phase 2) also the raw call/import Edges found in the same file.
+The chunker: turns a single .py file (or raw source text) into a list of
+Chunk objects, and (as of Phase 2) also the raw call/import Edges found in
+the same source.
 
 Deliberately hand-walks the tree-sitter syntax tree ourselves (no `.scm`
 query files) - the point of this project is to actually understand the
@@ -17,6 +18,11 @@ Walk logic in plain terms:
   - Every time we hit a `call` node, or an import statement, we hand it to
     parsing/edges.py to turn into an Edge, attributing it to whatever scope
     we're currently inside (or "<module>" if we're not inside anything).
+
+As of Phase 5, the walk is available on raw source text via `parse_source`,
+not just on real files on disk via `parse_file` - needed to parse a file's
+content as it existed at an old git ref, which isn't a file that exists
+anywhere on disk.
 """
 
 from __future__ import annotations
@@ -30,8 +36,7 @@ import tree_sitter_python as tspython
 from codeguard.parsing.edges import extract_call_edge, extract_import_edges
 from codeguard.parsing.ids import make_chunk_id
 from codeguard.parsing.models import Chunk, Edge
-from codeguard.storage.hashing import compute_file_blob_hash
-
+from codeguard.storage.hashing import compute_file_blob_hash, git_blob_hash
 PY_LANGUAGE = Language(tspython.language())
 
 IMPORT_NODE_TYPES = ("import_statement", "import_from_statement")
@@ -64,8 +69,13 @@ class Chunker:
         self, file_path: Path | str, project_root: Path | str
     ) -> tuple[list[Chunk], list[Edge]]:
         """
-        Parse one Python file and return BOTH the chunks (Phase 1) and the
-        raw calls/imports found in it (Phase 2), from a single tree walk.
+        Parse one Python file ON DISK and return BOTH the chunks (Phase 1)
+        and the raw calls/imports found in it (Phase 2).
+
+        Reads bytes + computes the file's blob hash, then hands off to
+        `parse_source` for the actual tree walk - kept as a thin wrapper so
+        the two concerns (I/O vs. walking logic) stay separate, the same
+        split already used for `build_graph` / `build_graph_from_storage`.
         """
         file_path = Path(file_path)
         project_root = Path(project_root)
@@ -73,6 +83,28 @@ class Chunker:
 
         source_bytes = file_path.read_bytes()
         blob_hash = compute_file_blob_hash(file_path)
+
+        return self.parse_source(source_bytes, rel_path, blob_hash=blob_hash)
+
+    def parse_source(
+        self,
+        source_bytes: bytes,
+        rel_path: str,
+        blob_hash: str | None = None,
+    ) -> tuple[list[Chunk], list[Edge]]:
+        """
+        Parse raw Python source text that is NOT necessarily a file on disk
+        (e.g. a file's content as it existed at an old git ref) and return
+        the same (chunks, edges) shape as `parse_file`.
+
+        `rel_path` is used exactly as `parse_file` uses it - as the
+        already-relative-to-project-root path to attribute chunks/edges to.
+        If `blob_hash` isn't supplied, it's computed directly from the given
+        bytes using the same git blob-hash formula (Phase 1, Decision C),
+        so old-ref content still gets a valid, comparable hash.
+        """
+        if blob_hash is None:
+            blob_hash = git_blob_hash(source_bytes)
 
         tree = self._parser.parse(source_bytes)
 
@@ -107,20 +139,13 @@ class Chunker:
                 edge = extract_call_edge(child, source_bytes, rel_path, scope_stack)
                 if edge is not None:
                     edges_out.append(edge)
-                # Keep walking INTO the call (e.g. its arguments) so a call
-                # nested inside another call's arguments is still found.
                 self._walk(child, source_bytes, rel_path, blob_hash, scope_stack,
                            chunks_out, edges_out)
             elif child.type in IMPORT_NODE_TYPES:
                 edges_out.extend(
                     extract_import_edges(child, source_bytes, rel_path, scope_stack)
                 )
-                # Import statements don't contain calls - no need to recurse.
             else:
-                # Not a definition, call, or import itself, but any of those
-                # could still be nested inside it (e.g. inside an
-                # `if __name__ == ...:` block, a loop, a try block) - keep
-                # looking.
                 self._walk(child, source_bytes, rel_path, blob_hash, scope_stack,
                            chunks_out, edges_out)
 
@@ -138,9 +163,6 @@ class Chunker:
         name_node = node.child_by_field_name("name")
         symbol_name = source_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8")
 
-        # A "function_definition" directly inside a class body is a method;
-        # otherwise it's a plain function (this also covers nested functions,
-        # whose enclosing scope kind is "function", not "class").
         if node_kind == "function":
             enclosing = scope_stack[-1].kind if scope_stack else None
             kind = "method" if enclosing == "class" else "function"
@@ -167,9 +189,6 @@ class Chunker:
             )
         )
 
-        # Recurse into the body to find methods (if this was a class),
-        # nested functions (if this was a function), and any calls/imports
-        # inside it - extending the scope so they're attributed correctly.
         body = node.child_by_field_name("body")
         if body is not None:
             new_scope = scope_stack + [_Scope(name=symbol_name, kind=node_kind, chunk_id=chunk_id)]
