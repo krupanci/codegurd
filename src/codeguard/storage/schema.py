@@ -1,9 +1,21 @@
 """
-LanceDB table schemas. `chunks` was added in Phase 1 - no vector column yet
-(that's added in Phase 6). `edges` is added in Phase 2.
+LanceDB table schemas. `chunks` was added in Phase 1; `edges` in Phase 2.
+
+Phase 6 adds one column to `chunks`: `vector`, a fixed-size list of
+float32 - the embedding of that chunk's `content`, produced by
+embedding/embedder.py. This is the ONLY schema change Phase 6 needs,
+because the design deliberately reused the existing `chunks` table
+instead of standing up a second storage system just for vectors.
 """
 
 import pyarrow as pa
+
+# Dimensionality of the `all-MiniLM-L6-v2` sentence-transformers model.
+# If the embedding model in config.py is ever swapped for one with a
+# different output size, this constant (and a re-index of the project)
+# needs to change with it - a mismatched dimension is a schema error,
+# not a silent bug, which is the safer failure mode.
+EMBEDDING_DIM = 384
 
 CHUNKS_TABLE_NAME = "chunks"
 
@@ -18,6 +30,10 @@ CHUNKS_SCHEMA = pa.schema(
         pa.field("end_line", pa.int64()),
         pa.field("content", pa.string()),
         pa.field("blob_hash", pa.string()),
+        # Fixed-size list, required (not a variable-length list) so LanceDB
+        # can build an ANN index over it later if the project grows large
+        # enough to need one.
+        pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
     ]
 )
 

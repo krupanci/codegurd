@@ -30,9 +30,7 @@ class CodeGuardSettings(BaseSettings):
     Any value here can be overridden with an env var prefixed CODEGUARD_
     (e.g. CODEGUARD_DB_DIR_NAME=my_db) or via a .env file in the current
     directory. This is also where future settings land as new phases need
-    them (embedding model name in Phase 6, an API key if a paid embedder
-    is ever swapped in, etc.) - one object, one place, rather than new
-    loose globals per phase.
+    them - one object, one place, rather than new loose globals per phase.
     """
 
     model_config = SettingsConfigDict(
@@ -45,6 +43,14 @@ class CodeGuardSettings(BaseSettings):
     project_root: Path
     codeguard_dir_name: str = Field(default=".codeguard")
     db_dir_name: str = Field(default="lancedb")
+
+    # --- Phase 6: embedding settings -------------------------------------
+    # Kept here (not hardcoded in embedder.py) so a paid/API embedder or a
+    # different local model can be swapped in later purely via env vars,
+    # with zero code changes - same reasoning the original design doc gave
+    # for keeping this in the settings object from day one.
+    embedding_model_name: str = Field(default="all-MiniLM-L6-v2")
+    embedding_dim: int = Field(default=384)  # must match the model above
 
     @property
     def codeguard_dir(self) -> Path:

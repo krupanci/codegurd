@@ -47,6 +47,21 @@ class Storage:
     def insert_chunks(self, chunks: list[Chunk]) -> None:
         if not chunks:
             return
+
+        # Phase 6: the `chunks` table's schema now has a required `vector`
+        # column. Catching a missing vector HERE, with a clear message,
+        # beats letting a confusing Arrow/LanceDB type error surface from
+        # deep inside `table.add()` - a chunk that skipped the embedding
+        # step is a caller bug, not a storage bug, so say so plainly.
+        missing = [c.chunk_id for c in chunks if c.vector is None]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} chunk(s) have no embedding vector and "
+                "cannot be inserted (e.g. chunk_id="
+                f"{missing[0]!r}). Run chunks through an Embedder first - "
+                "see codeguard.indexing.index_project."
+            )
+
         table = self._chunks_table()
         table.add([c.to_row() for c in chunks])
 
@@ -87,13 +102,39 @@ class Storage:
         above use), so this is a plain unfiltered scan. No `.where()`
         clause, matching the same `table.search()` pattern already used
         elsewhere in this class - `search()` here is just "read rows",
-        since the `chunks` table has no vector column yet (that only
-        arrives in Phase 6).
+        since we're not passing a query vector.
         """
         table = self._chunks_table()
         if table.count_rows() == 0:
             return []
         return table.search().to_list()
+
+    # --- semantic search (Phase 6) ----------------------------------------
+
+    def semantic_search(self, query_vector: list[float], limit: int = 10) -> list[dict]:
+        """
+        Nearest-neighbor search over the `chunks` table's `vector` column.
+
+        Returns the same row shape as `all_chunks()`, plus a `_distance`
+        field LanceDB adds automatically (cosine distance: 0 = identical
+        meaning, 2 = opposite meaning - closer to 0 is a better match).
+
+        This is a brute-force scan, which is exactly right at the scale
+        this tool targets (a single project's functions/classes - typically
+        thousands of rows, not millions). A real ANN index
+        (`table.create_index(...)`) only pays for itself at a much larger
+        scale, and would be a Phase 8+ concern if this tool ever needed to
+        search across many large projects at once.
+        """
+        table = self._chunks_table()
+        if table.count_rows() == 0:
+            return []
+        return (
+            table.search(query_vector, vector_column_name="vector")
+            .metric("cosine")
+            .limit(limit)
+            .to_list()
+        )
 
     # --- edges (Phase 2) --------------------------------------------------
     # Deliberately mirrors the chunk methods above exactly - same delete +

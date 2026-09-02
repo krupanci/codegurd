@@ -13,6 +13,7 @@ dependencies = [
     "pyarrow",
     "pydantic",
     "pydantic-settings",
+    "sentence-transformers",
 ]
 
 [project.scripts]

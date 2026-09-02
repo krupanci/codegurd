@@ -23,11 +23,25 @@ class Chunk:
     content: str            # raw source text of the chunk
     blob_hash: str          # git blob hash of the WHOLE FILE this chunk came from
 
+    # Phase 6: the embedding of `content`, filled in by an Embedder AFTER
+    # the chunk is created by Chunker (chunking and embedding stay two
+    # separate steps - a chunk can exist in memory with vector=None, e.g.
+    # while diffing old-vs-new content in Phase 5, without ever needing an
+    # embedding at all). Added at the END with a default so every existing
+    # Chunk(...) call site in Phases 1-5 keeps working unchanged.
+    vector: tuple[float, ...] | None = None
+
     def to_row(self) -> dict:
         """Dict shape matching storage/schema.py, ready to insert into LanceDB."""
-        return asdict(self)
-    
-    
+        row = asdict(self)
+        # LanceDB's Arrow writer wants a plain list for a fixed-size-list
+        # column, not a tuple - asdict() would otherwise hand it a tuple
+        # unchanged, since asdict only converts nested dataclasses.
+        if self.vector is not None:
+            row["vector"] = list(self.vector)
+        return row
+
+
 EdgeKind = Literal["calls", "imports"]
 
 
@@ -62,4 +76,3 @@ class Edge:
     def to_row(self) -> dict:
         """Dict shape matching storage/schema.py, ready to insert into LanceDB."""
         return asdict(self)
-    
