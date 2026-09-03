@@ -497,5 +497,43 @@ feature isn't actually trying to solve yet.
   under this feature's definition.
 
 
+=======================================================================
+## Phase 11 — Unified Context Engine + Query-Driven Retrieval Weighting
+
+### Decision A — One entry point over three separate commands
+**Chosen:** a new `context/` package (`get_context`) that always runs
+retrieval, and additionally runs impact analysis or dead-code checking
+only when the caller supplies an explicit signal (`ref`, `target_symbol`).
+**Why:** matches the product's actual goal — an agent should be able to
+ask "I'm about to do X, what do I need to know?" without knowing which
+of the three underlying engines to call. Routing on explicit fields
+rather than guessing from `task`'s wording keeps this deterministic:
+either the caller has a diff or it doesn't; there's no ambiguous middle
+case to misclassify.
+
+### Decision B — Retire the fixed bug_fix/explore intent classifier
+**Chosen:** replace `query_intent.classify_intent` + the fixed
+`_INTENT_PROFILES` table with `_derive_profile`, which computes the
+semantic/graph blend from signals measured in the query's own results
+(semantic-hit margin, graph density around the entry point) rather than
+matching the query's wording against a hardcoded keyword list.
+**Why:** the two-bucket classifier would need a new bucket and a new
+hand-picked keyword list every time a new kind of question showed up
+(e.g. "is this safe to delete," "what tests cover this"), with no
+principled way to detect a wrong guess on unlisted phrasing. The
+adaptive version has no buckets to run out of — any query, in any
+wording, produces a confidence/density reading and therefore a blend,
+so accuracy scales with how good the underlying signals are, not with
+how complete a keyword list is kept.
+
+### Other Phase 11 notes
+- `ContextItem` is a shared shape across retrieval, impact, and
+  deadcode output, so callers only ever handle one structure regardless
+  of which engine actually fired.
+- `query_intent.py` is superseded and no longer imported by
+  `retriever.py`; kept temporarily for Phase 9 comparison, candidate for
+  removal afterward.
+
+
 
 

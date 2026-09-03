@@ -35,6 +35,9 @@ from codeguard.indexing import index_project
 from codeguard.retrieval.report import render_retrieval_result
 from codeguard.retrieval.retriever import find_relevant_code
 from codeguard.storage.db import Storage
+from codeguard.context.bundle import get_context
+from codeguard.context.models import ContextRequest
+from codeguard.context.report import render_context_bundle
 
 app = typer.Typer()
 
@@ -102,6 +105,29 @@ def find(
 
     result = find_relevant_code(query, storage, max_results=max_results)
     typer.echo(render_retrieval_result(result))
+    
+@app.command()
+def context(
+    task: str = typer.Argument(
+        ..., help="Plain-English description, e.g. \"I'm about to change how login validates passwords\""
+    ),
+    target_symbol: str = typer.Option(
+        None, help="Qualified name of a specific symbol you're about to touch or remove, if known"
+    ),
+    ref: str = typer.Option(
+        None, help="Git ref to diff against, if you already have a change to check"
+    ),
+    max_results: int = typer.Option(8, help="Maximum number of retrieval results to include"),
+):
+    """Single entry point: 'I'm about to do X, what do I need to know?'"""
+    project_root, storage = _load_project()
+    _ensure_indexed(project_root, storage)
+
+    request = ContextRequest(
+        task=task, target_symbol=target_symbol, ref=ref, max_results=max_results
+    )
+    bundle = get_context(request, project_root, storage)
+    typer.echo(render_context_bundle(bundle))
 
 
 if __name__ == "__main__":
