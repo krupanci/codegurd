@@ -8,6 +8,14 @@ Nothing here is persisted. `build_graph_from_storage` is meant to be
 called once per CLI run - the graph is always rebuilt from the raw rows,
 never cached to disk itself (see PHASE3_DECISIONS.md, Decision E and the
 project's top-level architecture decision on this).
+
+CHANGE (bugfix): `max_hops` on `walk_forward` / `walk_reverse` is now
+optional. It previously had no default, but PHASE1_DECISIONS.md Decision E
+explicitly calls for the blast-radius feature to walk `walk_reverse()`
+"with no depth limit (full transitive closure)" - there was no way to
+express "no limit" before, and impact/analyzer.py was calling it with only
+one argument, which raised a TypeError on every run. `max_hops=None` now
+means "walk until nothing new is reachable."
 """
 
 from __future__ import annotations
@@ -60,6 +68,13 @@ class Graph:
         self._reverse: dict[str, set[str]] = {}
         self.chunks_by_id: dict[str, Chunk] = {}
 
+        # symbol_name -> chunk_id built lazily, on first use, by
+        # `find_by_qualified_name`. Avoids a linear scan every time a
+        # caller needs to go from a human-readable name (e.g. a CLI
+        # `--target-symbol` argument) to the chunk_id the graph itself
+        # is keyed on.
+        self._by_qualified_name: dict[str, str] | None = None
+
         # Kept for visibility, not used by traversal itself - useful for
         # a future accuracy report (Phase 9) or just manual inspection.
         self.unresolved: list[ResolvedEdge] = []
@@ -67,6 +82,7 @@ class Graph:
 
     def add_chunk(self, chunk: Chunk) -> None:
         self.chunks_by_id[chunk.chunk_id] = chunk
+        self._by_qualified_name = None  # invalidate lazy index
 
     def add_resolved_call(self, resolved: ResolvedEdge) -> None:
         """
@@ -99,20 +115,47 @@ class Graph:
         """Everything that directly calls `chunk_id` (one hop out, reverse)."""
         return self._reverse.get(chunk_id, set())
 
-    def walk_forward(self, start_id: str, max_hops: int) -> dict[str, int]:
+    def find_by_qualified_name(self, qualified_name: str) -> Chunk | None:
+        """
+        Look up a single chunk by its human-readable qualified name (e.g.
+        "LoginHandler.validate"), for callers that only know a symbol's
+        name and not its internal chunk_id - e.g. a CLI flag or an agent
+        naming a symbol it's about to touch.
+
+        Built and cached lazily on first call, invalidated whenever a new
+        chunk is added, so repeated lookups against the same graph don't
+        each re-scan every chunk.
+        """
+        if self._by_qualified_name is None:
+            self._by_qualified_name = {
+                chunk.qualified_name: chunk_id
+                for chunk_id, chunk in self.chunks_by_id.items()
+            }
+        chunk_id = self._by_qualified_name.get(qualified_name)
+        return self.chunks_by_id.get(chunk_id) if chunk_id else None
+
+    def walk_forward(self, start_id: str, max_hops: int | None = None) -> dict[str, int]:
         """Every chunk reachable by following calls OUTWARD from
-        `start_id`, up to `max_hops` steps. Returns {chunk_id: hop_distance},
-        not including `start_id` itself."""
+        `start_id`, up to `max_hops` steps (or with no limit at all if
+        `max_hops` is None). Returns {chunk_id: hop_distance}, not
+        including `start_id` itself."""
         return self._bfs(start_id, max_hops, self._forward)
 
-    def walk_reverse(self, start_id: str, max_hops: int) -> dict[str, int]:
+    def walk_reverse(self, start_id: str, max_hops: int | None = None) -> dict[str, int]:
         """Every chunk that can reach `start_id` by calling it (directly or
-        transitively), up to `max_hops` steps. Returns
-        {chunk_id: hop_distance}, not including `start_id` itself."""
+        transitively), up to `max_hops` steps (or with no limit at all if
+        `max_hops` is None - this is what change-impact/blast-radius uses,
+        per PHASE1_DECISIONS.md Decision E: full transitive closure).
+        Returns {chunk_id: hop_distance}, not including `start_id` itself.
+        """
         return self._bfs(start_id, max_hops, self._reverse)
 
     @staticmethod
-    def _bfs(start_id: str, max_hops: int, adjacency: dict[str, set[str]]) -> dict[str, int]:
+    def _bfs(
+        start_id: str,
+        max_hops: int | None,
+        adjacency: dict[str, set[str]],
+    ) -> dict[str, int]:
         """
         Plain iterative breadth-first search with an explicit queue and a
         visited set.
@@ -125,6 +168,10 @@ class Graph:
         walk would need the same visited-set threaded through every call
         anyway, with the added risk of hitting Python's recursion limit on
         a deep chain. See PHASE3_DECISIONS.md, Decision D.
+
+        `max_hops=None` walks until the whole reachable set has been
+        visited (full transitive closure) instead of stopping at a fixed
+        depth.
         """
         visited: dict[str, int] = {}
         seen = {start_id}
@@ -132,7 +179,7 @@ class Graph:
 
         while queue:
             current_id, depth = queue.popleft()
-            if depth == max_hops:
+            if max_hops is not None and depth == max_hops:
                 continue
             for neighbor in adjacency.get(current_id, ()):
                 if neighbor in seen:
@@ -180,6 +227,13 @@ def build_graph_from_storage(storage: Storage) -> Graph:
     Meant to be called once per CLI run - see `build_graph`'s docstring for
     why the actual graph-building logic lives there instead, decoupled
     from Storage entirely.
+
+    Callers that need the graph for more than one purpose in the same
+    logical operation (e.g. context/bundle.py running retrieval + impact +
+    dead-code together) should call this ONCE and pass the resulting Graph
+    into each engine, rather than each engine calling this again on its
+    own - see the `graph=` parameters on `find_relevant_code` and
+    `analyze_impact`.
     """
     chunks = [Chunk(**row) for row in storage.all_chunks()]
     edges = [Edge(**row) for row in storage.all_edges()]

@@ -6,6 +6,7 @@ ranking/selection logic stays in retriever.py.
 
 from __future__ import annotations
 
+from codeguard.rendering import format_reason
 from codeguard.retrieval.models import RetrievalResult
 
 
@@ -25,6 +26,6 @@ def render_retrieval_result(result: RetrievalResult) -> str:
             f"{marker}{chunk.file_path}  {chunk.qualified_name}  "
             f"[{chunk.relation}, score={chunk.final_score:.2f}]"
         )
-        lines.append(f"      {chunk.reason}")
+        lines.append(format_reason(chunk.reason))
 
     return "\n".join(lines)

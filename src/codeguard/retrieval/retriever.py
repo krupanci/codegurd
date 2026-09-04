@@ -22,14 +22,23 @@ guess on unlisted phrasing silently fell back to a default. This version
 has no buckets to run out of: any query, in any wording, gets a blend
 computed from what its own retrieval actually found — accurate and
 query-driven, with nothing to hardcode as new question types appear.
+
+CHANGE (perf/dedup): `graph` is now an optional parameter, same reasoning
+as impact/analyzer.py's `analyze_impact` — a caller running several
+engines in one logical request (context/bundle.py) can build the Graph
+once and pass it to all of them instead of each engine independently
+rebuilding it from storage.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from codeguard.embedding.embedder import Embedder, get_default_embedder
-from codeguard.graph.graph import build_graph_from_storage
+from codeguard.graph.graph import Graph, build_graph_from_storage
 from codeguard.retrieval.models import RelationType, RetrievalResult, RetrievedChunk
 from codeguard.storage.db import Storage
+from codeguard.token_budget import fit_to_budget
 
 # How many semantic candidates to pull before any graph reasoning happens.
 # Kept small on purpose — this is a shortlist, not the final bundle.
@@ -40,6 +49,12 @@ _SEMANTIC_CANDIDATES = 5
 _MAX_HOPS = 2
 
 _DEFAULT_MAX_RESULTS = 8
+
+# Default cap on the total estimated content size of a returned bundle.
+# Without this, a query that legitimately matches a handful of large
+# functions could hand back an unbounded amount of raw code - the exact
+# thing scoped retrieval exists to avoid. See token_budget.py.
+_DEFAULT_MAX_TOKENS = 6000
 
 # Baseline relation weights before any per-query adjustment. Every query
 # starts here; _derive_profile below adjusts them using signals measured
@@ -58,12 +73,25 @@ def find_relevant_code(
     storage: Storage,
     embedder: Embedder | None = None,
     max_results: int = _DEFAULT_MAX_RESULTS,
+    graph: Graph | None = None,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
 ) -> RetrievalResult:
     """
     Given a plain-English problem description, return a small ranked
     bundle of chunks, each with a one-line reason it was included.
 
     Returns an empty result if the project hasn't been indexed yet.
+
+    `graph`: pass an already-built Graph to skip rebuilding one from
+    storage (used by context/bundle.py when running multiple engines in
+    one call). Left as None for standalone use (e.g. the CLI), in which
+    case one is built here exactly as before.
+
+    `max_tokens`: hard cap on the combined estimated size of the returned
+    chunks' content (see token_budget.py). `max_results` limits how many
+    chunks are considered; this limits how much text they're allowed to
+    total, since even a small handful of large functions could otherwise
+    return an unbounded amount of raw code.
     """
     embedder = embedder or get_default_embedder()
 
@@ -77,8 +105,9 @@ def find_relevant_code(
     semantic_scores = {row["chunk_id"]: _similarity_from_distance(row) for row in semantic_hits}
 
     # Step 2: graph walk — who does the entry point depend on, who depends
-    # on it (Phase 3's forward/reverse BFS, rebuilt fresh from storage).
-    graph = build_graph_from_storage(storage)
+    # on it (Phase 3's forward/reverse BFS, reused as-is or built fresh).
+    if graph is None:
+        graph = build_graph_from_storage(storage)
     chunks_by_id = graph.chunks_by_id
     dependencies = graph.walk_forward(entry_id, _MAX_HOPS)  # what it calls
     callers = graph.walk_reverse(entry_id, _MAX_HOPS)        # what calls it
@@ -137,7 +166,17 @@ def find_relevant_code(
     entry = next(c for c in ranked if c.chunk_id == entry_id)
     rest = [c for c in ranked if c.chunk_id != entry_id][: max(0, max_results - 1)]
 
-    return RetrievalResult(query=query, entry_point_chunk_id=entry_id, chunks=[entry, *rest])
+    # Step 5: token budget - the list is already best-first, so this only
+    # ever truncates/drops from the tail (see token_budget.py). A
+    # high-scoring match's content shrinks before it disappears.
+    bundle = fit_to_budget(
+        [entry, *rest],
+        max_tokens,
+        content_of=lambda c: c.content,
+        replace_content=lambda c, new_content: replace(c, content=new_content),
+    )
+
+    return RetrievalResult(query=query, entry_point_chunk_id=entry_id, chunks=bundle)
 
 
 def _consider(

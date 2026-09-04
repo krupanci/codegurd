@@ -11,6 +11,16 @@ cheaply check, how much should you trust that silence?"
 Every check below only ever DOWNGRADES confidence or adds an explanation -
 nothing is ever silently dropped from the report, matching the same
 philosophy Phase 3's resolver already used for ambiguous call targets.
+
+CHANGE (dedup/perf): the per-chunk classification logic used to only be
+reachable by looping over every chunk in the project (`find_dead_code`).
+Callers that already know the ONE symbol they care about (e.g.
+context/bundle.py's `target_symbol`) had no way to ask that question
+directly - they had to run the full-project scan (including a rglob over
+every non-Python file) and then throw away every result except one. The
+classification logic is now a standalone function, `_classify_chunk`, used
+by both `find_dead_code` (loop over everything) and the new `check_symbol`
+(check exactly one, already-identified chunk).
 """
 
 from __future__ import annotations
@@ -21,6 +31,7 @@ from codeguard.deadcode.decorators import get_decorator_names
 from codeguard.deadcode.models import OrphanFinding, Tier
 from codeguard.deadcode.rules import all_callers_are_tests, matching_dynamic_decorator
 from codeguard.graph.graph import Graph
+from codeguard.parsing.models import Chunk
 
 # Candidate orphans only ever get checked against non-Python files with
 # these extensions - kept small and explicit rather than "everything that
@@ -44,66 +55,84 @@ def find_dead_code(graph: Graph, project_root: Path) -> list[OrphanFinding]:
     """
     findings: list[OrphanFinding] = []
 
-    for chunk_id, chunk in graph.chunks_by_id.items():
+    for chunk in graph.chunks_by_id.values():
         if chunk.kind not in _CALLABLE_KINDS:
             continue
-
-        caller_ids = graph.callers(chunk_id)
-
-        if caller_ids:
-            # Has real callers - not a dead-code candidate at all, UNLESS
-            # every single caller is a test, which is a different, milder
-            # finding worth surfacing separately (see rules.py docstring
-            # for why an empty caller list is handled as a separate branch
-            # rather than folded into this same check).
-            caller_paths = [_caller_file_path(graph, cid) for cid in caller_ids]
-            if all_callers_are_tests(caller_paths):
-                findings.append(
-                    _finding(chunk, "test_only", "every caller found is inside a test file")
-                )
-            continue
-
-        # No callers at all - genuine orphan candidate. Run it through the
-        # confidence checks in order; the first one that fires decides the
-        # tier, since the plan's own tiers are ordered buckets, not scores
-        # to combine (same "priority chain, not weighted score" reasoning
-        # as Phase 3's resolver).
-        decorators = get_decorator_names(chunk, project_root)
-        matched_decorator = matching_dynamic_decorator(decorators)
-        if matched_decorator:
-            findings.append(
-                _finding(
-                    chunk,
-                    "possibly_dynamic_usage",
-                    f"decorator '@{matched_decorator}' matches a known dynamic-invocation pattern",
-                )
-            )
-            continue
-
-        match_file = _scan_non_python_files(chunk.symbol_name, project_root)
-        if match_file is not None:
-            findings.append(
-                _finding(
-                    chunk,
-                    "possibly_used_outside_python",
-                    f"symbol name also appears in {match_file} - may be invoked dynamically",
-                )
-            )
-            continue
-
-        findings.append(
-            _finding(
-                chunk,
-                "high_confidence_dead",
-                "no Python callers, no matching decorator pattern, "
-                "no reference found in non-Python files",
-            )
-        )
+        finding = _classify_chunk(chunk, graph, project_root)
+        if finding is not None:
+            findings.append(finding)
 
     return findings
 
 
-def _finding(chunk, tier: Tier, reason: str) -> OrphanFinding:
+def check_symbol(
+    graph: Graph, project_root: Path, qualified_name: str
+) -> OrphanFinding | None:
+    """
+    Run the exact same classification a single, already-named symbol
+    would get from `find_dead_code`, without scanning every other chunk
+    in the project first.
+
+    Returns None if the symbol isn't found, or if it has real (non-test)
+    callers and therefore isn't a dead-code candidate at all - the same
+    "not worth reporting" outcome `find_dead_code` would silently skip.
+    """
+    chunk = graph.find_by_qualified_name(qualified_name)
+    if chunk is None or chunk.kind not in _CALLABLE_KINDS:
+        return None
+    return _classify_chunk(chunk, graph, project_root)
+
+
+def _classify_chunk(chunk: Chunk, graph: Graph, project_root: Path) -> OrphanFinding | None:
+    """
+    Classify one callable chunk. Returns None if it has real callers and
+    isn't test-only either (i.e. it's clearly in active use, nothing to
+    report).
+    """
+    caller_ids = graph.callers(chunk.chunk_id)
+
+    if caller_ids:
+        # Has real callers - not a dead-code candidate at all, UNLESS
+        # every single caller is a test, which is a different, milder
+        # finding worth surfacing separately (see rules.py docstring
+        # for why an empty caller list is handled as a separate branch
+        # rather than folded into this same check).
+        caller_paths = [_caller_file_path(graph, cid) for cid in caller_ids]
+        if all_callers_are_tests(caller_paths):
+            return _finding(chunk, "test_only", "every caller found is inside a test file")
+        return None
+
+    # No callers at all - genuine orphan candidate. Run it through the
+    # confidence checks in order; the first one that fires decides the
+    # tier, since the plan's own tiers are ordered buckets, not scores
+    # to combine (same "priority chain, not weighted score" reasoning
+    # as Phase 3's resolver).
+    decorators = get_decorator_names(chunk, project_root)
+    matched_decorator = matching_dynamic_decorator(decorators)
+    if matched_decorator:
+        return _finding(
+            chunk,
+            "possibly_dynamic_usage",
+            f"decorator '@{matched_decorator}' matches a known dynamic-invocation pattern",
+        )
+
+    match_file = _scan_non_python_files(chunk.symbol_name, project_root)
+    if match_file is not None:
+        return _finding(
+            chunk,
+            "possibly_used_outside_python",
+            f"symbol name also appears in {match_file} - may be invoked dynamically",
+        )
+
+    return _finding(
+        chunk,
+        "high_confidence_dead",
+        "no Python callers, no matching decorator pattern, "
+        "no reference found in non-Python files",
+    )
+
+
+def _finding(chunk: Chunk, tier: Tier, reason: str) -> OrphanFinding:
     return OrphanFinding(
         chunk_id=chunk.chunk_id,
         qualified_name=chunk.qualified_name,
@@ -140,6 +169,11 @@ def _scan_non_python_files(symbol_name: str, project_root: Path) -> str | None:
     template call, a JS fetch handled by a Python route) has no OTHER way
     to point at a Python symbol except by containing its exact name as
     text somewhere.
+
+    This walks the project's non-Python files once PER SYMBOL being
+    checked, which is why `check_symbol` (checking one already-named
+    symbol) is far cheaper than `find_dead_code` (which may run this once
+    per orphan candidate across the whole project).
 
     Returns the first matching file's path (relative to project_root) or
     None. Deliberately kept inline here rather than a separate scanner.py

@@ -11,6 +11,7 @@ is the first place that actually needs to print a report to a person.
 from __future__ import annotations
 
 from codeguard.deadcode.models import OrphanFinding, Tier
+from codeguard.rendering import format_reason
 
 # Ordered most to least trustworthy, same order as the Tier type itself -
 # a person reading the report sees the findings worth acting on first.
@@ -43,7 +44,7 @@ def render_deadcode_report(findings: list[OrphanFinding]) -> str:
                 f"  {finding.file_path}:{finding.start_line}  "
                 f"{finding.qualified_name}  [{finding.kind}]"
             )
-            lines.append(f"      reason: {finding.reason}")
+            lines.append(format_reason(finding.reason, label="reason"))
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

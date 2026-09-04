@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-Source = Literal["retrieval", "impact", "deadcode"]
+Source = Literal["retrieval", "impact", "deadcode", "overview"]
 
 
 @dataclass
@@ -20,17 +20,19 @@ class ContextRequest:
 
     `task` is the only required field and is always free text — it is
     never parsed for keywords or sorted into a fixed set of "intents".
-    `target_symbol` and `ref` are optional, EXPLICIT signals: if the
-    caller already knows it's about to touch a specific symbol, or
-    already has a diff to check, it says so directly instead of CodeGuard
-    guessing that from the wording of `task`. Which engines run is
-    decided from the presence of these fields (see context/bundle.py),
-    not from classifying `task` itself.
+    `target_symbol`, `ref`, and `orient` are optional, EXPLICIT signals:
+    if the caller already knows it's about to touch a specific symbol,
+    already has a diff to check, or wants whole-repo orientation, it says
+    so directly instead of CodeGuard guessing that from the wording of
+    `task`. Which engines run is decided from the presence of these
+    fields (see context/bundle.py), not from classifying `task` itself.
     """
     task: str
     target_symbol: str | None = None
     ref: str | None = None
+    orient: bool = False
     max_results: int = 8
+    max_tokens: int = 6000
 
 
 @dataclass(frozen=True)
@@ -48,12 +50,14 @@ class ContextItem:
 
     source: Source           # which engine produced this item
     relation: str             # "entry_point" / "caller" / "dependency" /
-                                # "related" / "blast_radius" / "dead_code_candidate"
+                                # "related" / "blast_radius" / "dead_code_candidate" /
+                                # "structurally_important"
     hop_distance: int          # -1 when not applicable / not graph-connected
     confidence: str | None     # deadcode tier, or None when not applicable
     score: float                 # 0..1, used to sort within the bundle
 
     reason: str                  # one-line, human-readable "why this is here"
+    notes: list[str] = field(default_factory=list)  # persisted annotations on this symbol
 
 
 @dataclass

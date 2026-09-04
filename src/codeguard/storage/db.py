@@ -8,6 +8,8 @@ data, and so nothing about "which database am I talking to" is hidden state.
 
 from __future__ import annotations
 
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import lancedb
@@ -15,10 +17,14 @@ import lancedb
 from codeguard.config import CodeGuardSettings
 from codeguard.parsing.models import Chunk, Edge
 from codeguard.storage.schema import (
+    ANNOTATIONS_SCHEMA,
+    ANNOTATIONS_TABLE_NAME,
     CHUNKS_SCHEMA,
     CHUNKS_TABLE_NAME,
     EDGES_SCHEMA,
     EDGES_TABLE_NAME,
+    REPO_META_SCHEMA,
+    REPO_META_TABLE_NAME,
 )
 
 
@@ -164,3 +170,81 @@ class Storage:
         if table.count_rows() == 0:
             return []
         return table.search().to_list()
+
+    # --- annotations --------------------------------------------------
+    # Persisted notes on symbols, so something an agent or person figures
+    # out ("this function is fragile, only covered by one manual test")
+    # survives across sessions instead of being lost the moment the
+    # process exits. Mirrors the same delete/insert-table-access style as
+    # the chunk/edge methods above - same class, no new concepts.
+
+    def _annotations_table(self):
+        if ANNOTATIONS_TABLE_NAME in self._db.list_tables().tables:
+            return self._db.open_table(ANNOTATIONS_TABLE_NAME)
+        return self._db.create_table(ANNOTATIONS_TABLE_NAME, schema=ANNOTATIONS_SCHEMA)
+
+    def insert_annotation(
+        self,
+        chunk_id: str,
+        qualified_name: str,
+        file_path: str,
+        note: str,
+        author: str,
+    ) -> None:
+        table = self._annotations_table()
+        table.add(
+            [
+                {
+                    "annotation_id": str(uuid.uuid4()),
+                    "chunk_id": chunk_id,
+                    "qualified_name": qualified_name,
+                    "file_path": file_path,
+                    "note": note,
+                    "author": author,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ]
+        )
+
+    def get_annotations_for_chunk(self, chunk_id: str) -> list[dict]:
+        table = self._annotations_table()
+        if table.count_rows() == 0:
+            return []
+        safe_id = chunk_id.replace("'", "''")
+        return table.search().where(f"chunk_id = '{safe_id}'").to_list()
+
+    def all_annotations(self) -> list[dict]:
+        table = self._annotations_table()
+        if table.count_rows() == 0:
+            return []
+        return table.search().to_list()
+
+    # --- repo metadata (Phase: index-corruption guard) -----------------
+    # A single row recording which embedder/dimension the index on disk
+    # was actually built with, so a config.py change to the embedding
+    # model can be detected instead of silently mixing vector spaces.
+    # See indexing.py's staleness check.
+
+    def _repo_meta_table(self):
+        if REPO_META_TABLE_NAME in self._db.list_tables().tables:
+            return self._db.open_table(REPO_META_TABLE_NAME)
+        return self._db.create_table(REPO_META_TABLE_NAME, schema=REPO_META_SCHEMA)
+
+    def get_repo_meta(self) -> dict | None:
+        table = self._repo_meta_table()
+        if table.count_rows() == 0:
+            return None
+        rows = table.search().limit(1).to_list()
+        return rows[0] if rows else None
+
+    def set_repo_meta(self, embedder_name: str, embedding_dim: int) -> None:
+        """
+        Overwrites the single repo_meta row. The table is dropped and
+        recreated rather than deleted-then-inserted, because a one-row
+        metadata table has no stable predicate to match "the existing
+        row" - there is always exactly one, regardless of its values.
+        """
+        if REPO_META_TABLE_NAME in self._db.list_tables().tables:
+            self._db.drop_table(REPO_META_TABLE_NAME)
+        table = self._db.create_table(REPO_META_TABLE_NAME, schema=REPO_META_SCHEMA)
+        table.add([{"embedder_name": embedder_name, "embedding_dim": embedding_dim}])

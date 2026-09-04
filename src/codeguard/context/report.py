@@ -6,6 +6,7 @@ retrieval/report.py, impact/report.py, deadcode/report.py.
 from __future__ import annotations
 
 from codeguard.context.models import ContextBundle
+from codeguard.rendering import format_reason
 
 
 def render_context_bundle(bundle: ContextBundle) -> str:
@@ -23,6 +24,8 @@ def render_context_bundle(bundle: ContextBundle) -> str:
             f"[{item.source}/{item.relation}{conf}] "
             f"{item.file_path}  {item.qualified_name}  (score={item.score:.2f})"
         )
-        lines.append(f"      {item.reason}")
+        lines.append(format_reason(item.reason))
+        for note in item.notes:
+            lines.append(format_reason(note, label="note"))
 
     return "\n".join(lines)
